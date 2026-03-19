@@ -590,6 +590,8 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `--config <path>` | Use a custom config file (or `AGENT_BROWSER_CONFIG` env) |
 | `--debug` | Debug output |
 
+On Tizen, `open <url>` now passes the initial URL directly to `ubrowser` during launch. If the inspector socket is up before a page target becomes attachable, the first `open` still returns success, but later commands still depend on an attachable page target.
+
 ## Configuration
 
 Create an `agent-browser.json` file to set persistent defaults instead of repeating flags on every command.

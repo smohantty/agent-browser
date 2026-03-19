@@ -9,13 +9,13 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::sync::{broadcast, oneshot, RwLock};
 
 use super::auth;
-use super::browser::{BrowserManager, WaitUntil};
+use super::browser::{is_attachable_page_target, BrowserManager, WaitUntil};
 use super::cdp::chrome::LaunchOptions;
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
     AttachToTargetParams, AttachToTargetResult, CdpEvent, ConsoleApiCalledEvent,
-    CreateTargetResult, DispatchMouseEventParams, ExceptionThrownEvent, TargetCreatedEvent,
-    TargetDestroyedEvent,
+    CreateTargetResult, DispatchMouseEventParams, ExceptionThrownEvent, TargetDestroyedEvent,
+    TargetInfo, TargetInfoChangedEvent,
 };
 use super::cookies;
 use super::diff;
@@ -338,15 +338,19 @@ impl DaemonState {
         recording::stop_recording_task(&mut self.recording_state).await
     }
 
-    fn drain_cdp_events(&mut self) -> (Vec<i64>, Vec<TargetCreatedEvent>, Vec<String>) {
+    fn drain_cdp_events(&mut self) -> (Vec<i64>, Vec<TargetInfo>, Vec<String>) {
         let rx = match self.event_rx.as_mut() {
             Some(rx) => rx,
             None => return (Vec::new(), Vec::new(), Vec::new()),
         };
 
         let mut pending_acks: Vec<i64> = Vec::new();
-        let mut new_targets: Vec<TargetCreatedEvent> = Vec::new();
+        let mut new_targets: Vec<TargetInfo> = Vec::new();
         let mut destroyed_targets: Vec<String> = Vec::new();
+        let allow_empty_page_targets = self
+            .browser
+            .as_ref()
+            .is_some_and(BrowserManager::allows_empty_page_targets);
 
         loop {
             match rx.try_recv() {
@@ -354,20 +358,43 @@ impl DaemonState {
                     // Target events are not session-scoped; handle them first
                     match event.method.as_str() {
                         "Target.targetCreated" => {
-                            if let Ok(te) =
-                                serde_json::from_value::<TargetCreatedEvent>(event.params.clone())
-                            {
-                                if (te.target_info.target_type == "page"
-                                    || te.target_info.target_type == "webview")
-                                    && !te.target_info.url.is_empty()
+                            if let Ok(te) = serde_json::from_value::<super::cdp::types::TargetCreatedEvent>(
+                                event.params.clone(),
+                            ) {
+                                let already_tracked = self
+                                    .browser
+                                    .as_ref()
+                                    .is_some_and(|b| b.has_target(&te.target_info.target_id))
+                                    || new_targets
+                                        .iter()
+                                        .any(|t| t.target_id == te.target_info.target_id);
+                                if is_attachable_page_target(
+                                    &te.target_info,
+                                    allow_empty_page_targets,
+                                ) && !already_tracked
                                 {
-                                    let already_tracked = self
-                                        .browser
-                                        .as_ref()
-                                        .is_none_or(|b| b.has_target(&te.target_info.target_id));
-                                    if !already_tracked {
-                                        new_targets.push(te);
-                                    }
+                                    new_targets.push(te.target_info);
+                                }
+                            }
+                            continue;
+                        }
+                        "Target.targetInfoChanged" => {
+                            if let Ok(te) =
+                                serde_json::from_value::<TargetInfoChangedEvent>(event.params.clone())
+                            {
+                                let already_tracked = self
+                                    .browser
+                                    .as_ref()
+                                    .is_some_and(|b| b.has_target(&te.target_info.target_id))
+                                    || new_targets
+                                        .iter()
+                                        .any(|t| t.target_id == te.target_info.target_id);
+                                if is_attachable_page_target(
+                                    &te.target_info,
+                                    allow_empty_page_targets,
+                                ) && !already_tracked
+                                {
+                                    new_targets.push(te.target_info);
                                 }
                             }
                             continue;
@@ -660,14 +687,17 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         }
     }
 
-    for te in &new_targets {
+    for target_info in &new_targets {
         if let Some(ref mut mgr) = state.browser {
+            if mgr.has_target(&target_info.target_id) {
+                continue;
+            }
             let attach_result: Result<AttachToTargetResult, String> = mgr
                 .client
                 .send_command_typed(
                     "Target.attachToTarget",
                     &AttachToTargetParams {
-                        target_id: te.target_info.target_id.clone(),
+                        target_id: target_info.target_id.clone(),
                         flatten: true,
                     },
                     None,
@@ -688,11 +718,11 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                 }
 
                 mgr.add_page(super::browser::PageInfo {
-                    target_id: te.target_info.target_id.clone(),
+                    target_id: target_info.target_id.clone(),
                     session_id: attach.session_id,
-                    url: te.target_info.url.clone(),
-                    title: te.target_info.title.clone(),
-                    target_type: te.target_info.target_type.clone(),
+                    url: target_info.url.clone(),
+                    title: target_info.title.clone(),
+                    target_type: target_info.target_type.clone(),
                 });
             }
         }
@@ -788,7 +818,9 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
 
         if let Some(ref mut mgr) = state.browser {
             if mgr.page_count() == 0 {
-                let _ = mgr.ensure_page().await;
+                if let Err(e) = mgr.ensure_page().await {
+                    return error_response(&id, &format!("Auto-launch failed: {}", e));
+                }
             }
         }
     }
@@ -1016,6 +1048,7 @@ async fn auto_launch(state: &mut DaemonState) -> Result<(), String> {
     state.start_fetch_handler();
     state.update_stream_client().await;
     try_auto_restore_state(state).await;
+
     Ok(())
 }
 
@@ -1037,6 +1070,7 @@ fn launch_options_from_env() -> LaunchOptions {
         proxy: env::var("AGENT_BROWSER_PROXY").ok(),
         proxy_bypass: env::var("AGENT_BROWSER_PROXY_BYPASS").ok(),
         profile: env::var("AGENT_BROWSER_PROFILE").ok(),
+        initial_url: None,
         allow_file_access: env::var("AGENT_BROWSER_ALLOW_FILE_ACCESS")
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false),
@@ -1236,6 +1270,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             .get("profile")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
+        initial_url: None,
         allow_file_access: cmd
             .get("allowFileAccess")
             .and_then(|v| v.as_bool())
@@ -1633,8 +1668,14 @@ async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
 // ---------------------------------------------------------------------------
 
 async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let session_id = {
+        let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
+        if mgr.page_count() == 0 {
+            mgr.ensure_page().await?;
+        }
+        mgr.active_session_id()?.to_string()
+    };
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
 
     let options = SnapshotOptions {
         selector: cmd

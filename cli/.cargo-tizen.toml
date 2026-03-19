@@ -1,0 +1,5 @@
+[default]
+arch = "armv7l"
+profile = "tizen"
+platform_version = "10.0"
+provider = "rootstrap"

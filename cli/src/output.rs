@@ -2706,6 +2706,7 @@ Install:
 
 Examples:
   agent-browser open example.com
+  # On Tizen, initial open passes the URL directly to ubrowser if CDP is up
   agent-browser snapshot -i              # Interactive elements only
   agent-browser click @e2                # Click by ref from snapshot
   agent-browser fill @e3 "test@example.com"

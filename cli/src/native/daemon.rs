@@ -1,4 +1,5 @@
 use serde_json::Value;
+use crate::connection::get_socket_dir;
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -17,7 +18,7 @@ use super::state;
 use super::stream::StreamServer;
 
 pub async fn run_daemon(session: &str) {
-    let socket_dir = get_daemon_socket_dir();
+    let socket_dir = get_socket_dir();
     if !socket_dir.exists() {
         let _ = fs::create_dir_all(&socket_dir);
     }
@@ -108,6 +109,8 @@ async fn run_socket_server(
 
     let (reset_tx, mut reset_rx) = mpsc::channel::<()>(64);
     let reset_tx = idle_timeout_ms.map(|_| Arc::new(reset_tx));
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+    let shutdown_tx = Arc::new(shutdown_tx);
 
     loop {
         let sleep_future = idle_timeout_ms.map(|ms| tokio::time::sleep(Duration::from_millis(ms)));
@@ -119,8 +122,9 @@ async fn run_socket_server(
                     Ok((stream, _)) => {
                         let state = state.clone();
                         let reset_tx = reset_tx.clone();
+                        let shutdown_tx = shutdown_tx.clone();
                         tokio::spawn(async move {
-                            handle_connection(stream, state, reset_tx).await;
+                            handle_connection(stream, state, reset_tx, shutdown_tx).await;
                         });
                     }
                     Err(e) => {
@@ -143,6 +147,13 @@ async fn run_socket_server(
             }
             _ = reset_rx.recv(), if idle_timeout_ms.is_some() => {
                 continue;
+            }
+            _ = shutdown_rx.recv() => {
+                let mut s = state.lock().await;
+                if let Some(ref mut mgr) = s.browser {
+                    let _ = mgr.close().await;
+                }
+                break;
             }
             _ = shutdown_signal() => {
                 let mut s = state.lock().await;
@@ -182,6 +193,8 @@ async fn run_socket_server(
 
     let (reset_tx, mut reset_rx) = mpsc::channel::<()>(64);
     let reset_tx = idle_timeout_ms.map(|_| Arc::new(reset_tx));
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+    let shutdown_tx = Arc::new(shutdown_tx);
 
     loop {
         let sleep_future = idle_timeout_ms.map(|ms| tokio::time::sleep(Duration::from_millis(ms)));
@@ -193,8 +206,9 @@ async fn run_socket_server(
                     Ok((stream, _)) => {
                         let state = state.clone();
                         let reset_tx = reset_tx.clone();
+                        let shutdown_tx = shutdown_tx.clone();
                         tokio::spawn(async move {
-                            handle_connection(stream, state, reset_tx).await;
+                            handle_connection(stream, state, reset_tx, shutdown_tx).await;
                         });
                     }
                     Err(e) => {
@@ -219,6 +233,14 @@ async fn run_socket_server(
             _ = reset_rx.recv(), if idle_timeout_ms.is_some() => {
                 continue;
             }
+            _ = shutdown_rx.recv() => {
+                let mut s = state.lock().await;
+                if let Some(ref mut mgr) = s.browser {
+                    let _ = mgr.close().await;
+                }
+                let _ = fs::remove_file(&port_path);
+                break;
+            }
             _ = shutdown_signal() => {
                 let mut s = state.lock().await;
                 if let Some(ref mut mgr) = s.browser {
@@ -237,6 +259,7 @@ async fn handle_connection<S>(
     stream: S,
     state: std::sync::Arc<tokio::sync::Mutex<DaemonState>>,
     idle_reset_tx: Option<Arc<mpsc::Sender<()>>>,
+    shutdown_tx: Arc<mpsc::Sender<()>>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -291,7 +314,8 @@ async fn handle_connection<S>(
 
                 if is_close {
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    process::exit(0);
+                    let _ = shutdown_tx.try_send(());
+                    break;
                 }
             }
             Err(_) => break,
@@ -349,26 +373,6 @@ async fn shutdown_signal() {
             process::exit(1);
         }
     }
-}
-
-fn get_daemon_socket_dir() -> PathBuf {
-    if let Ok(dir) = env::var("AGENT_BROWSER_SOCKET_DIR") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir);
-        }
-    }
-
-    if let Ok(xdg) = env::var("XDG_RUNTIME_DIR") {
-        if !xdg.is_empty() {
-            return PathBuf::from(xdg).join("agent-browser");
-        }
-    }
-
-    if let Some(home) = dirs::home_dir() {
-        return home.join(".agent-browser");
-    }
-
-    std::env::temp_dir().join("agent-browser")
 }
 
 #[cfg(windows)]

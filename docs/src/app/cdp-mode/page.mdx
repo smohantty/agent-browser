@@ -57,6 +57,10 @@ This is useful when:
 - You want a zero-configuration connection to your existing browser
 - You don't want to track which port Chrome is using
 
+## Tizen note
+
+On Tizen, `open <url>` in local-launch mode passes the initial URL directly to `ubrowser`. That avoids relying on `Target.createTarget` for the first page when the browser-level inspector socket is up before a page target becomes attachable. Later commands still require an attachable page target from the Tizen CDP backend.
+
 ## Color scheme
 
 Use `--color-scheme` to set a persistent preference when connecting via CDP:

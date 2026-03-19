@@ -665,6 +665,8 @@ Supported engines:
 - `chrome` (default) -- Chrome/Chromium via CDP
 - `lightpanda` -- Lightpanda headless browser via CDP (10x faster, 10x less memory than Chrome)
 
+On Tizen targets, `open <url>` passes the initial URL directly to `ubrowser` during launch. That avoids relying on `Target.createTarget` for the first page, but later commands still need an attachable page target from the Tizen CDP backend.
+
 Lightpanda does not support `--extension`, `--profile`, `--state`, or `--allow-file-access`. Install Lightpanda from https://lightpanda.io/docs/open-source/installation.
 
 ## Ready-to-Use Templates

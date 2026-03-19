@@ -9,6 +9,7 @@ use super::cdp::chrome::{auto_connect_cdp, launch_chrome, ChromeProcess, LaunchO
 use super::cdp::client::CdpClient;
 use super::cdp::discovery::discover_cdp_url;
 use super::cdp::lightpanda::{launch_lightpanda, LightpandaLaunchOptions, LightpandaProcess};
+use super::cdp::tizen::{is_tizen, launch_ubrowser, TizenProcess};
 use super::cdp::types::*;
 
 // ---------------------------------------------------------------------------
@@ -95,6 +96,17 @@ fn is_internal_chrome_target(url: &str) -> bool {
         || url.starts_with("devtools://")
 }
 
+pub(crate) fn is_attachable_page_target(target: &TargetInfo, allow_empty_url: bool) -> bool {
+    let is_page_target = target.target_type == "page" || target.target_type == "webview";
+    if !is_page_target {
+        return false;
+    }
+    if !target.url.is_empty() && is_internal_chrome_target(&target.url) {
+        return false;
+    }
+    allow_empty_url || !target.url.is_empty()
+}
+
 /// Converts common error messages into AI-friendly, actionable descriptions.
 pub fn to_ai_friendly_error(error: &str) -> String {
     let lower = error.to_lowercase();
@@ -149,6 +161,7 @@ impl WaitUntil {
 pub enum BrowserProcess {
     Chrome(ChromeProcess),
     Lightpanda(LightpandaProcess),
+    Tizen(TizenProcess),
 }
 
 impl BrowserProcess {
@@ -156,6 +169,7 @@ impl BrowserProcess {
         match self {
             BrowserProcess::Chrome(p) => p.kill(),
             BrowserProcess::Lightpanda(p) => p.kill(),
+            BrowserProcess::Tizen(p) => p.kill(),
         }
     }
 
@@ -163,6 +177,7 @@ impl BrowserProcess {
         match self {
             BrowserProcess::Chrome(p) => p.wait_or_kill(timeout),
             BrowserProcess::Lightpanda(p) => p.kill(),
+            BrowserProcess::Tizen(p) => p.kill(),
         }
     }
 }
@@ -171,6 +186,7 @@ pub struct BrowserManager {
     pub client: Arc<CdpClient>,
     browser_process: Option<BrowserProcess>,
     ws_url: String,
+    pending_initial_url: Option<String>,
     pages: Vec<PageInfo>,
     active_page_index: usize,
     default_timeout_ms: u64,
@@ -179,10 +195,22 @@ pub struct BrowserManager {
 const LIGHTPANDA_CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const LIGHTPANDA_CDP_CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const LIGHTPANDA_TARGET_INIT_TIMEOUT: Duration = Duration::from_secs(10);
+const TIZEN_TARGET_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const TIZEN_TARGET_DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 impl BrowserManager {
     pub async fn launch(options: LaunchOptions, engine: Option<&str>) -> Result<Self, String> {
-        let engine = engine.unwrap_or("chrome");
+        // Auto-detect: if no engine specified and ubrowser is available, use it
+        let engine = match engine {
+            Some(e) => e,
+            None => {
+                if is_tizen() {
+                    "tizen"
+                } else {
+                    "chrome"
+                }
+            }
+        };
 
         match engine {
             "chrome" => {
@@ -198,9 +226,10 @@ impl BrowserManager {
             "lightpanda" => {
                 validate_lightpanda_options(&options)?;
             }
+            "tizen" => {}
             _ => {
                 return Err(format!(
-                    "Unknown engine '{}'. Supported engines: chrome, lightpanda",
+                    "Unknown engine '{}'. Supported engines: chrome, lightpanda, tizen",
                     engine
                 ));
             }
@@ -210,8 +239,17 @@ impl BrowserManager {
         let user_agent = options.user_agent.clone();
         let color_scheme = options.color_scheme.clone();
         let download_path = options.download_path.clone();
+        let pending_initial_url = None;
 
         let (ws_url, process) = match engine {
+            "tizen" => {
+                let exec_path = options.executable_path.clone();
+                let tp = tokio::task::spawn_blocking(move || launch_ubrowser(exec_path.as_deref()))
+                    .await
+                    .map_err(|e| format!("ubrowser launch task failed: {}", e))??;
+                let url = tp.ws_url.clone();
+                (url, BrowserProcess::Tizen(tp))
+            }
             "lightpanda" => {
                 let lp_options = LightpandaLaunchOptions {
                     executable_path: options.executable_path.clone(),
@@ -234,11 +272,16 @@ impl BrowserManager {
         let manager = if engine == "lightpanda" {
             initialize_lightpanda_manager(ws_url, process).await?
         } else {
-            let client = Arc::new(CdpClient::connect(&ws_url).await?);
+            let client = Arc::new(
+                CdpClient::connect(&ws_url)
+                    .await
+                    .map_err(|e| format!("Failed to connect to CDP at {}: {}", ws_url, e))?,
+            );
             let mut manager = Self {
                 client,
                 browser_process: Some(process),
                 ws_url,
+                pending_initial_url,
                 pages: Vec::new(),
                 active_page_index: 0,
                 default_timeout_ms: 25_000,
@@ -247,39 +290,39 @@ impl BrowserManager {
             manager
         };
 
-        let session_id = manager.active_session_id()?.to_string();
+        if let Ok(session_id) = manager.active_session_id().map(str::to_string) {
+            if ignore_https_errors {
+                let _ = manager
+                    .client
+                    .send_command(
+                        "Security.setIgnoreCertificateErrors",
+                        Some(json!({ "ignore": true })),
+                        Some(&session_id),
+                    )
+                    .await;
+            }
 
-        if ignore_https_errors {
-            let _ = manager
-                .client
-                .send_command(
-                    "Security.setIgnoreCertificateErrors",
-                    Some(json!({ "ignore": true })),
-                    Some(&session_id),
-                )
-                .await;
-        }
+            if let Some(ref ua) = user_agent {
+                let _ = manager
+                    .client
+                    .send_command(
+                        "Emulation.setUserAgentOverride",
+                        Some(json!({ "userAgent": ua })),
+                        Some(&session_id),
+                    )
+                    .await;
+            }
 
-        if let Some(ref ua) = user_agent {
-            let _ = manager
-                .client
-                .send_command(
-                    "Emulation.setUserAgentOverride",
-                    Some(json!({ "userAgent": ua })),
-                    Some(&session_id),
-                )
-                .await;
-        }
-
-        if let Some(ref scheme) = color_scheme {
-            let _ = manager
-                .client
-                .send_command(
-                    "Emulation.setEmulatedMedia",
-                    Some(json!({ "features": [{ "name": "prefers-color-scheme", "value": scheme }] })),
-                    Some(&session_id),
-                )
-                .await;
+            if let Some(ref scheme) = color_scheme {
+                let _ = manager
+                    .client
+                    .send_command(
+                        "Emulation.setEmulatedMedia",
+                        Some(json!({ "features": [{ "name": "prefers-color-scheme", "value": scheme }] })),
+                        Some(&session_id),
+                    )
+                    .await;
+            }
         }
 
         if let Some(ref path) = download_path {
@@ -303,6 +346,7 @@ impl BrowserManager {
             client,
             browser_process: None,
             ws_url,
+            pending_initial_url: None,
             pages: Vec::new(),
             active_page_index: 0,
             default_timeout_ms: 10_000,
@@ -317,6 +361,115 @@ impl BrowserManager {
         Self::connect_cdp(&ws_url).await
     }
 
+    fn supports_target_create(&self) -> bool {
+        !matches!(
+            self.browser_process.as_ref(),
+            Some(BrowserProcess::Tizen(_))
+        )
+    }
+
+    pub(crate) fn allows_empty_page_targets(&self) -> bool {
+        self.is_tizen_backend()
+    }
+
+    async fn fetch_attachable_page_targets(&self) -> Result<Vec<TargetInfo>, String> {
+        let result: GetTargetsResult = self
+            .client
+            .send_command_typed("Target.getTargets", &json!({}), None)
+            .await?;
+
+        Ok(result
+            .target_infos
+            .into_iter()
+            .filter(|t| is_attachable_page_target(t, self.allows_empty_page_targets()))
+            .collect())
+    }
+
+    async fn wait_for_attachable_page_targets(
+        &self,
+        timeout: Duration,
+    ) -> Result<Vec<TargetInfo>, String> {
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            let targets = self.fetch_attachable_page_targets().await?;
+            if !targets.is_empty() {
+                return Ok(targets);
+            }
+            if Instant::now() >= deadline {
+                return Ok(targets);
+            }
+            tokio::time::sleep(TIZEN_TARGET_DISCOVERY_POLL_INTERVAL).await;
+        }
+    }
+
+    async fn create_blank_target_and_attach(&mut self) -> Result<(), String> {
+        let result: CreateTargetResult = self
+            .client
+            .send_command_typed(
+                "Target.createTarget",
+                &CreateTargetParams {
+                    url: "about:blank".to_string(),
+                },
+                None,
+            )
+            .await?;
+
+        let attach_result: AttachToTargetResult = self
+            .client
+            .send_command_typed(
+                "Target.attachToTarget",
+                &AttachToTargetParams {
+                    target_id: result.target_id.clone(),
+                    flatten: true,
+                },
+                None,
+            )
+            .await?;
+
+        self.pending_initial_url = None;
+        self.pages.push(PageInfo {
+            target_id: result.target_id,
+            session_id: attach_result.session_id.clone(),
+            url: "about:blank".to_string(),
+            title: String::new(),
+            target_type: "page".to_string(),
+        });
+        self.active_page_index = 0;
+        self.enable_domains(&attach_result.session_id).await?;
+        Ok(())
+    }
+
+    async fn attach_existing_targets(&mut self, page_targets: &[TargetInfo]) -> Result<(), String> {
+        for target in page_targets {
+            let attach_result: AttachToTargetResult = self
+                .client
+                .send_command_typed(
+                    "Target.attachToTarget",
+                    &AttachToTargetParams {
+                        target_id: target.target_id.clone(),
+                        flatten: true,
+                    },
+                    None,
+                )
+                .await?;
+
+            self.pending_initial_url = None;
+            self.pages.push(PageInfo {
+                target_id: target.target_id.clone(),
+                session_id: attach_result.session_id.clone(),
+                url: target.url.clone(),
+                title: target.title.clone(),
+                target_type: target.target_type.clone(),
+            });
+        }
+
+        self.active_page_index = 0;
+        let session_id = self.pages[0].session_id.clone();
+        self.enable_domains(&session_id).await?;
+        Ok(())
+    }
+
     async fn discover_and_attach_targets(&mut self) -> Result<(), String> {
         self.client
             .send_command_typed::<_, Value>(
@@ -326,81 +479,36 @@ impl BrowserManager {
             )
             .await?;
 
-        let result: GetTargetsResult = self
-            .client
-            .send_command_typed("Target.getTargets", &json!({}), None)
-            .await?;
-
-        let page_targets: Vec<TargetInfo> = result
-            .target_infos
-            .into_iter()
-            .filter(|t| {
-                (t.target_type == "page" || t.target_type == "webview")
-                    && !t.url.is_empty()
-                    && !is_internal_chrome_target(&t.url)
-            })
-            .collect();
+        let mut page_targets = self.fetch_attachable_page_targets().await?;
+        if page_targets.is_empty() && !self.supports_target_create() {
+            page_targets = self
+                .wait_for_attachable_page_targets(TIZEN_TARGET_DISCOVERY_TIMEOUT)
+                .await?;
+            if page_targets.is_empty() {
+                return Ok(());
+            }
+            self.attach_existing_targets(&page_targets).await?;
+            return Ok(());
+        }
 
         if page_targets.is_empty() {
-            // Create a new tab
-            let result: CreateTargetResult = self
-                .client
-                .send_command_typed(
-                    "Target.createTarget",
-                    &CreateTargetParams {
-                        url: "about:blank".to_string(),
-                    },
-                    None,
-                )
-                .await?;
-
-            let attach_result: AttachToTargetResult = self
-                .client
-                .send_command_typed(
-                    "Target.attachToTarget",
-                    &AttachToTargetParams {
-                        target_id: result.target_id.clone(),
-                        flatten: true,
-                    },
-                    None,
-                )
-                .await?;
-
-            self.pages.push(PageInfo {
-                target_id: result.target_id,
-                session_id: attach_result.session_id.clone(),
-                url: "about:blank".to_string(),
-                title: String::new(),
-                target_type: "page".to_string(),
-            });
-            self.active_page_index = 0;
-            self.enable_domains(&attach_result.session_id).await?;
-        } else {
-            for target in &page_targets {
-                let attach_result: AttachToTargetResult = self
-                    .client
-                    .send_command_typed(
-                        "Target.attachToTarget",
-                        &AttachToTargetParams {
-                            target_id: target.target_id.clone(),
-                            flatten: true,
-                        },
-                        None,
-                    )
-                    .await?;
-
-                self.pages.push(PageInfo {
-                    target_id: target.target_id.clone(),
-                    session_id: attach_result.session_id.clone(),
-                    url: target.url.clone(),
-                    title: target.title.clone(),
-                    target_type: target.target_type.clone(),
-                });
+            match self.create_blank_target_and_attach().await {
+                Ok(()) => {}
+                Err(err)
+                    if err.contains("Target.createTarget") && err.contains("Not supported") =>
+                {
+                    page_targets = self
+                        .wait_for_attachable_page_targets(TIZEN_TARGET_DISCOVERY_TIMEOUT)
+                        .await?;
+                    if page_targets.is_empty() {
+                        return Ok(());
+                    }
+                    self.attach_existing_targets(&page_targets).await?;
+                }
+                Err(err) => return Err(err),
             }
-
-            self.active_page_index = 0;
-            let session_id = self.pages[0].session_id.clone();
-            self.enable_domains(&session_id).await?;
+        } else {
+            self.attach_existing_targets(&page_targets).await?;
         }
 
         Ok(())
@@ -508,11 +616,20 @@ impl BrowserManager {
     }
 
     pub async fn get_url(&self) -> Result<String, String> {
+        if self.pages.is_empty() {
+            return self
+                .pending_initial_url
+                .clone()
+                .ok_or_else(|| "No active page".to_string());
+        }
         let result = self.evaluate_simple("location.href").await?;
         Ok(result.as_str().unwrap_or("").to_string())
     }
 
     pub async fn get_title(&self) -> Result<String, String> {
+        if self.pages.is_empty() && self.pending_initial_url.is_some() {
+            return Ok(String::new());
+        }
         let result = self.evaluate_simple("document.title").await?;
         Ok(result.as_str().unwrap_or("").to_string())
     }
@@ -635,10 +752,31 @@ impl BrowserManager {
         self.browser_process.is_none()
     }
 
+    pub fn is_tizen_backend(&self) -> bool {
+        matches!(
+            self.browser_process.as_ref(),
+            Some(BrowserProcess::Tizen(_))
+        )
+    }
+
     /// Ensures the browser has at least one page. If `pages` is empty, creates a new
     /// about:blank page and attaches to it.
     pub async fn ensure_page(&mut self) -> Result<(), String> {
         if !self.pages.is_empty() {
+            return Ok(());
+        }
+
+        if !self.supports_target_create() {
+            let page_targets = self
+                .wait_for_attachable_page_targets(TIZEN_TARGET_DISCOVERY_TIMEOUT)
+                .await?;
+            if page_targets.is_empty() {
+                return Err(format!(
+                    "No attachable page targets appeared within {}ms.",
+                    TIZEN_TARGET_DISCOVERY_TIMEOUT.as_millis()
+                ));
+            }
+            self.attach_existing_targets(&page_targets).await?;
             return Ok(());
         }
 
@@ -739,6 +877,7 @@ impl BrowserManager {
         self.enable_domains(&attach.session_id).await?;
 
         let index = self.pages.len();
+        self.pending_initial_url = None;
         self.pages.push(PageInfo {
             target_id: result.target_id,
             session_id: attach.session_id,
@@ -1048,6 +1187,7 @@ impl BrowserManager {
     }
 
     pub fn add_page(&mut self, page: PageInfo) {
+        self.pending_initial_url = None;
         let index = self.pages.len();
         self.pages.push(page);
         self.active_page_index = index;
@@ -1215,6 +1355,7 @@ async fn initialize_lightpanda_manager(
             client: Arc::new(client),
             browser_process: None,
             ws_url: ws_url.clone(),
+            pending_initial_url: None,
             pages: Vec::new(),
             active_page_index: 0,
             default_timeout_ms: 25_000,

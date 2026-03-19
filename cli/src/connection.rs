@@ -11,6 +11,8 @@ use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(unix)]
+use crate::native::cdp::tizen::is_tizen;
 
 #[derive(Serialize)]
 #[allow(dead_code)]
@@ -82,7 +84,7 @@ impl Connection {
 }
 
 /// Get the base directory for socket/pid files.
-/// Priority: AGENT_BROWSER_SOCKET_DIR > XDG_RUNTIME_DIR > ~/.agent-browser > tmpdir
+/// Priority: AGENT_BROWSER_SOCKET_DIR > Tizen stable runtime dir > XDG_RUNTIME_DIR > ~/.agent-browser > tmpdir
 pub fn get_socket_dir() -> PathBuf {
     // 1. Explicit override (ignore empty string)
     if let Ok(dir) = env::var("AGENT_BROWSER_SOCKET_DIR") {
@@ -91,19 +93,26 @@ pub fn get_socket_dir() -> PathBuf {
         }
     }
 
-    // 2. XDG_RUNTIME_DIR (Linux standard, ignore empty string)
+    // 2. Tizen/root launcher environments can vary XDG_RUNTIME_DIR between
+    // `/run` and `/run/user/0`. Pin them to a stable shared location.
+    #[cfg(unix)]
+    if is_tizen() {
+        return PathBuf::from("/run/agent-browser");
+    }
+
+    // 3. XDG_RUNTIME_DIR (Linux standard, ignore empty string)
     if let Ok(runtime_dir) = env::var("XDG_RUNTIME_DIR") {
         if !runtime_dir.is_empty() {
             return PathBuf::from(runtime_dir).join("agent-browser");
         }
     }
 
-    // 3. Home directory fallback (like Docker Desktop's ~/.docker/run/)
+    // 4. Home directory fallback (like Docker Desktop's ~/.docker/run/)
     if let Some(home) = dirs::home_dir() {
         return home.join(".agent-browser");
     }
 
-    // 4. Last resort: temp dir
+    // 5. Last resort: temp dir
     env::temp_dir().join("agent-browser")
 }
 
