@@ -9,6 +9,7 @@ use super::cdp::chrome::{auto_connect_cdp, launch_chrome, ChromeProcess, LaunchO
 use super::cdp::client::CdpClient;
 use super::cdp::discovery::discover_cdp_url;
 use super::cdp::lightpanda::{launch_lightpanda, LightpandaLaunchOptions, LightpandaProcess};
+use super::cdp::tizen::{is_tizen, launch_ubrowser, TizenProcess};
 use super::cdp::types::*;
 
 // ---------------------------------------------------------------------------
@@ -149,6 +150,7 @@ impl WaitUntil {
 pub enum BrowserProcess {
     Chrome(ChromeProcess),
     Lightpanda(LightpandaProcess),
+    Tizen(TizenProcess),
 }
 
 impl BrowserProcess {
@@ -156,6 +158,7 @@ impl BrowserProcess {
         match self {
             BrowserProcess::Chrome(p) => p.kill(),
             BrowserProcess::Lightpanda(p) => p.kill(),
+            BrowserProcess::Tizen(p) => p.kill(),
         }
     }
 
@@ -163,6 +166,7 @@ impl BrowserProcess {
         match self {
             BrowserProcess::Chrome(p) => p.wait_or_kill(timeout),
             BrowserProcess::Lightpanda(p) => p.kill(),
+            BrowserProcess::Tizen(p) => p.kill(),
         }
     }
 }
@@ -182,7 +186,17 @@ const LIGHTPANDA_TARGET_INIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl BrowserManager {
     pub async fn launch(options: LaunchOptions, engine: Option<&str>) -> Result<Self, String> {
-        let engine = engine.unwrap_or("chrome");
+        // Auto-detect: if no engine specified and ubrowser is available, use it
+        let engine = match engine {
+            Some(e) => e,
+            None => {
+                if is_tizen() {
+                    "tizen"
+                } else {
+                    "chrome"
+                }
+            }
+        };
 
         match engine {
             "chrome" => {
@@ -198,9 +212,10 @@ impl BrowserManager {
             "lightpanda" => {
                 validate_lightpanda_options(&options)?;
             }
+            "tizen" => {}
             _ => {
                 return Err(format!(
-                    "Unknown engine '{}'. Supported engines: chrome, lightpanda",
+                    "Unknown engine '{}'. Supported engines: chrome, lightpanda, tizen",
                     engine
                 ));
             }
@@ -212,6 +227,16 @@ impl BrowserManager {
         let download_path = options.download_path.clone();
 
         let (ws_url, process) = match engine {
+            "tizen" => {
+                let exec_path = options.executable_path.clone();
+                let tp = tokio::task::spawn_blocking(move || {
+                    launch_ubrowser(exec_path.as_deref())
+                })
+                .await
+                .map_err(|e| format!("ubrowser launch task failed: {}", e))??;
+                let url = tp.ws_url.clone();
+                (url, BrowserProcess::Tizen(tp))
+            }
             "lightpanda" => {
                 let lp_options = LightpandaLaunchOptions {
                     executable_path: options.executable_path.clone(),
